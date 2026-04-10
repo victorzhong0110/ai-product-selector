@@ -1,0 +1,27 @@
+# API Keys — 绝对不要提交
+backend/.env
+
+# SQLite 数据库（本地数据，不提交）
+backend/ai_selector.db
+backend/*.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log

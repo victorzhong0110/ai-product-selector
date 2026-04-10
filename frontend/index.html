@@ -1,0 +1,993 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
+  <title>AI 选品决策工具</title>
+
+  <style>
+    /* Loading screen — visible before React mounts */
+    #app-loading {
+      position: fixed; inset: 0; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 14px;
+      background: #f8fafc; z-index: 9999; font-family: -apple-system, sans-serif;
+    }
+    #app-loading .spinner {
+      width: 44px; height: 44px; border: 3px solid #e2e8f0;
+      border-top-color: #0ea5e9; border-radius: 50%;
+      animation: ldSpin 0.8s linear infinite;
+    }
+    @keyframes ldSpin { to { transform: rotate(360deg); } }
+    #app-loading p { font-size: 14px; color: #64748b; margin: 0; }
+
+    /* Error banner — hidden unless JS crashes */
+    #app-error {
+      display: none; position: fixed; top: 0; left: 0; right: 0; z-index: 99999;
+      background: #fef2f2; border-bottom: 2px solid #fca5a5;
+      padding: 10px 18px; font-family: monospace; font-size: 12px; color: #b91c1c;
+      white-space: pre-wrap; max-height: 200px; overflow: auto;
+    }
+
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+    .fade-in { animation: fadeIn 0.3s ease-in; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+    ::-webkit-scrollbar { width: 5px; }
+    ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 9999px; }
+  </style>
+
+  <!-- 1. Error catcher + Tailwind warning suppressor (must be first) -->
+  <script>
+    window.onerror = function(msg, src, line, col, err) {
+      var el = document.getElementById('app-error');
+      if (el) {
+        el.style.display = 'block';
+        el.textContent = '⚠️ 脚本错误: ' + msg + '\n来源: ' + src + ' 行: ' + line;
+      }
+    };
+    const _warn = console.warn.bind(console);
+    console.warn = (...a) => {
+      if (typeof a[0] === 'string' && a[0].includes('cdn.tailwindcss.com')) return;
+      _warn(...a);
+    };
+  </script>
+
+  <!-- 2. Tailwind Play CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- 3. React 18 — jsDelivr (稳定国内可用) -->
+  <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.development.js"></script>
+  <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.development.js"></script>
+
+  <!-- 4. Babel standalone — jsDelivr -->
+  <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
+</head>
+<body class="bg-slate-50 min-h-screen">
+
+<!-- Error banner -->
+<div id="app-error"></div>
+
+<!-- Loading screen: shown immediately, hidden after React mounts -->
+<div id="app-loading">
+  <div class="spinner"></div>
+  <p>AI 选品工具加载中…</p>
+  <p style="font-size:11px;color:#94a3b8">首次加载需要下载依赖，请稍候</p>
+</div>
+
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useCallback, useRef } = React;
+
+// ─── Config ────────────────────────────────────────────────────────
+const API_BASE = 'http://localhost:8000/api';
+
+async function apiFetch(path, opts = {}) {
+  const url = API_BASE + path;
+  const res = await fetch(url, {
+    headers: { 'Content-Type': 'application/json' },
+    ...opts,
+  });
+  if (res.status === 204) return null;
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.detail || 'Request failed');
+  return data;
+}
+
+// ─── Constants ─────────────────────────────────────────────────────
+const REC_CFG = {
+  STRONG_BUY: { label: '强力推荐', bg: 'bg-emerald-100', text: 'text-emerald-800', dot: 'bg-emerald-500' },
+  BUY:        { label: '推荐选品', bg: 'bg-sky-100',     text: 'text-sky-800',     dot: 'bg-sky-500' },
+  HOLD:       { label: '持续观察', bg: 'bg-amber-100',   text: 'text-amber-800',   dot: 'bg-amber-500' },
+  AVOID:      { label: '不建议',   bg: 'bg-red-100',     text: 'text-red-800',     dot: 'bg-red-500' },
+};
+const STATUS_CFG = {
+  pending:   { label: '等待中',   cls: 'bg-slate-100 text-slate-500' },
+  analyzing: { label: 'AI分析中', cls: 'bg-sky-100 text-sky-700',  pulse: true },
+  completed: { label: '已完成',   cls: 'bg-emerald-100 text-emerald-700' },
+  failed:    { label: '失败',     cls: 'bg-red-100 text-red-600' },
+};
+const CATEGORIES = ['Electronics','Home & Garden','Sports & Outdoors',
+  'Beauty & Health','Pet Supplies','Toys & Games','Kitchen & Dining',
+  'Clothing & Accessories','Office Products','Baby & Kids'];
+const MARKETS = [
+  {v:'CN',l:'🇨🇳 中国'},{v:'US',l:'🇺🇸 美国'},{v:'EU',l:'🇪🇺 欧盟'},
+  {v:'UK',l:'🇬🇧 英国'},{v:'AU',l:'🇦🇺 澳大利亚'},{v:'CA',l:'🇨🇦 加拿大'},
+  {v:'JP',l:'🇯🇵 日本'},{v:'GLOBAL',l:'🌍 全球'}
+];
+const CHART_COLORS = ['#0ea5e9','#6366f1','#10b981','#f59e0b','#ef4444'];
+
+function scoreColor(s) {
+  if (!s) return 'text-slate-400';
+  if (s >= 80) return 'text-emerald-600'; if (s >= 65) return 'text-sky-600';
+  if (s >= 50) return 'text-amber-600'; return 'text-red-500';
+}
+function scoreBg(s) {
+  if (!s) return 'bg-slate-300'; if (s >= 80) return 'bg-emerald-500';
+  if (s >= 65) return 'bg-sky-500'; if (s >= 50) return 'bg-amber-500'; return 'bg-red-500';
+}
+function fmtNum(n) {
+  if (!n) return '—'; return n >= 1000 ? `${(n/1000).toFixed(1)}K` : String(n);
+}
+function fmtDate(s) {
+  if (!s) return ''; const d = new Date(s+'Z');
+  return d.toLocaleDateString('zh-CN',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
+}
+
+// ─── Pure-SVG Radar Chart (no external lib) ─────────────────────────
+function SvgRadar({ data, size = 220 }) {
+  if (!data || data.length === 0) return null;
+  const cx = size / 2, cy = size / 2, r = size * 0.36;
+  const n = data.length;
+  const angles = data.map((_, i) => (Math.PI * 2 * i) / n - Math.PI / 2);
+  const pt = (ratio, a) => [cx + Math.cos(a) * r * ratio, cy + Math.sin(a) * r * ratio];
+  const pts = (ratio) => angles.map(a => pt(ratio, a)).map(([x,y]) => `${x},${y}`).join(' ');
+  const dataCoords = angles.map((a, i) => pt(Math.min((data[i].v || 0) / 100, 1), a));
+  const dataPts = dataCoords.map(([x,y]) => `${x},${y}`).join(' ');
+  return (
+    <svg viewBox={`0 0 ${size} ${size}`} width="100%" height={size} style={{overflow:'visible'}}>
+      {[0.25, 0.5, 0.75, 1].map(level => (
+        <polygon key={level} points={pts(level)} fill="none" stroke="#e2e8f0" strokeWidth="1"/>
+      ))}
+      {angles.map((a, i) => {
+        const [x2, y2] = pt(1, a);
+        return <line key={i} x1={cx} y1={cy} x2={x2} y2={y2} stroke="#e2e8f0" strokeWidth="1"/>;
+      })}
+      <polygon points={dataPts} fill="#0ea5e9" fillOpacity="0.18" stroke="#0ea5e9" strokeWidth="2"/>
+      {dataCoords.map(([x,y], i) => <circle key={i} cx={x} cy={y} r="3.5" fill="#0ea5e9"/>)}
+      {angles.map((a, i) => {
+        const [lx, ly] = pt(1.24, a);
+        return (
+          <text key={i} x={lx} y={ly} textAnchor="middle" dominantBaseline="middle"
+            fontSize="10.5" fill="#64748b">{data[i].s}</text>
+        );
+      })}
+    </svg>
+  );
+}
+
+// ─── CSS Bar Chart (no external lib) ────────────────────────────────
+function CssBarChart({ data, dataKey, nameKey = 'name', colors = CHART_COLORS, height = 170 }) {
+  if (!data || data.length === 0) return <div className="h-36 flex items-center justify-center text-slate-400 text-sm">暂无数据</div>;
+  const max = Math.max(...data.map(d => d[dataKey] || 0), 1);
+  const barH = Math.floor((height - data.length * 8) / data.length);
+  return (
+    <div className="space-y-2.5" style={{minHeight: height}}>
+      {data.map((item, i) => {
+        const pct = (item[dataKey] || 0) / max * 100;
+        return (
+          <div key={i}>
+            <div className="flex justify-between items-center mb-0.5">
+              <span className="text-xs text-slate-600 truncate max-w-[65%]">{item[nameKey]}</span>
+              <span className="text-xs font-semibold text-slate-700">{item[dataKey]}</span>
+            </div>
+            <div className="h-2.5 bg-slate-100 rounded-full overflow-hidden">
+              <div className="h-full rounded-full transition-all duration-700"
+                   style={{width: pct + '%', background: colors[i % colors.length]}}/>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ─── CSS Horizontal Bar Chart (for keywords) ────────────────────────
+function CssHBarChart({ data, valKey, nameKey, colors = CHART_COLORS }) {
+  if (!data || data.length === 0) return null;
+  const max = Math.max(...data.map(d => d[valKey] || 0), 1);
+  return (
+    <div className="space-y-2">
+      {data.map((item, i) => {
+        const pct = (item[valKey] || 0) / max * 100;
+        return (
+          <div key={i} className="flex items-center gap-2">
+            <span className="text-xs text-slate-600 w-32 truncate text-right shrink-0">{item[nameKey]}</span>
+            <div className="flex-1 h-2.5 bg-slate-100 rounded-full overflow-hidden">
+              <div className="h-full rounded-full transition-all duration-700"
+                   style={{width: pct + '%', background: colors[i % colors.length]}}/>
+            </div>
+            <span className="text-xs font-semibold text-slate-600 w-7 shrink-0">{item[valKey]}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ─── Small Components ───────────────────────────────────────────────
+function Spinner({ size = 20 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" className="animate-spin" style={{animation:'spin 1s linear infinite'}}>
+      <circle cx="12" cy="12" r="10" stroke="#e2e8f0" strokeWidth="3" fill="none"/>
+      <path d="M12 2a10 10 0 0 1 10 10" stroke="#0ea5e9" strokeWidth="3" fill="none" strokeLinecap="round"/>
+    </svg>
+  );
+}
+
+function Badge({ children, className = '' }) {
+  return <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold ${className}`}>{children}</span>;
+}
+
+function RecBadge({ rec }) {
+  if (!rec) return null;
+  const c = REC_CFG[rec] || REC_CFG.HOLD;
+  return (
+    <Badge className={`${c.bg} ${c.text}`}>
+      <span className={`w-1.5 h-1.5 rounded-full ${c.dot} mr-1.5 inline-block`}/>
+      {c.label}
+    </Badge>
+  );
+}
+
+function ScoreCircle({ score, size = 'md', label }) {
+  const sizes = { sm:'w-14 h-14 text-sm', md:'w-20 h-20 text-xl', lg:'w-28 h-28 text-3xl' };
+  const bg = scoreBg(score); const tc = scoreColor(score);
+  return (
+    <div className="flex flex-col items-center gap-1">
+      <div className={`${sizes[size] || sizes.md} rounded-full border-4 flex items-center justify-center`}
+           style={{borderColor: score >= 80 ? '#10b981' : score >= 65 ? '#0ea5e9' : score >= 50 ? '#f59e0b' : score ? '#ef4444' : '#cbd5e1',
+                   background: score >= 80 ? '#f0fdf4' : score >= 65 ? '#f0f9ff' : score >= 50 ? '#fffbeb' : score ? '#fef2f2' : '#f8fafc'}}>
+        <span className={`font-bold ${tc}`}>{score ? Math.round(score) : '—'}</span>
+      </div>
+      {label && <span className="text-xs text-slate-500 text-center">{label}</span>}
+    </div>
+  );
+}
+
+function ScoreBar({ label, score, icon }) {
+  const pct = score ? Math.min(100, Math.round(score)) : 0;
+  return (
+    <div className="space-y-1">
+      <div className="flex justify-between items-center">
+        <span className="text-sm text-slate-600">{icon && <span className="mr-1">{icon}</span>}{label}</span>
+        <span className={`text-sm font-semibold ${scoreColor(score)}`}>{score ? Math.round(score) : '—'}</span>
+      </div>
+      <div className="h-2 bg-slate-100 rounded-full overflow-hidden">
+        <div className={`h-full ${scoreBg(score)} rounded-full transition-all duration-700`} style={{width: pct + '%'}} />
+      </div>
+    </div>
+  );
+}
+
+// ─── View Router (simple hash-based) ───────────────────────────────
+function useRoute() {
+  const [hash, setHash] = useState(window.location.hash || '#/');
+  useEffect(() => {
+    const h = () => setHash(window.location.hash || '#/');
+    window.addEventListener('hashchange', h);
+    return () => window.removeEventListener('hashchange', h);
+  }, []);
+  const navigate = (path) => { window.location.hash = path; };
+  return { hash, navigate };
+}
+
+// ─── Navbar ────────────────────────────────────────────────────────
+function Navbar({ navigate, currentHash }) {
+  return (
+    <nav className="bg-white border-b border-slate-200 sticky top-0 z-40">
+      <div className="max-w-6xl mx-auto px-4 sm:px-6 flex items-center justify-between h-14">
+        {/* Logo */}
+        <button onClick={() => navigate('#/')} className="flex items-center gap-2 hover:opacity-80">
+          <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-sky-500 to-indigo-600 flex items-center justify-center text-white font-bold text-sm">AI</div>
+          <div className="text-left">
+            <div className="text-sm font-bold text-slate-900 leading-none">AI 选品工具</div>
+            <div className="text-[10px] text-slate-400 leading-none mt-0.5">Cross-border Intelligence</div>
+          </div>
+        </button>
+        {/* Nav */}
+        <div className="flex items-center gap-1">
+          {[['#/', '仪表盘'], ['#/analyses', '选品库']].map(([h, l]) => (
+            <button key={h} onClick={() => navigate(h)}
+              className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
+                currentHash === h || (h === '#/' && currentHash === '#/')
+                  ? 'bg-sky-50 text-sky-700' : 'text-slate-600 hover:bg-slate-50'}`}>
+              {l}
+            </button>
+          ))}
+        </div>
+        <button onClick={() => navigate('#/new')}
+          className="flex items-center gap-1.5 bg-sky-600 hover:bg-sky-700 text-white text-sm font-semibold px-4 py-2 rounded-xl transition-colors">
+          <span>+</span> 新建分析
+        </button>
+      </div>
+    </nav>
+  );
+}
+
+// ─── Dashboard Page ─────────────────────────────────────────────────
+function Dashboard({ navigate }) {
+  const [stats, setStats] = useState(null);
+
+  useEffect(() => {
+    apiFetch('/dashboard').then(setStats).catch(() => {});
+  }, []);
+
+  const cards = [
+    { l:'总分析数', v: stats?.total_analyses ?? 0, s:'历史记录',    icon:'📦', bg:'bg-sky-50',     tc:'text-sky-700' },
+    { l:'已完成',   v: stats?.completed ?? 0,       s:'AI分析完成',  icon:'✅', bg:'bg-emerald-50', tc:'text-emerald-700' },
+    { l:'强力推荐', v: stats?.strong_buy_count ?? 0,s:'优质选品',    icon:'⭐', bg:'bg-violet-50',  tc:'text-violet-700' },
+    { l:'平均评分', v: stats?.avg_score ? `${stats.avg_score}` : '—', s:'满分100', icon:'🎯', bg:'bg-amber-50', tc:'text-amber-700' },
+  ];
+
+  return (
+    <div className="space-y-6 fade-in">
+      {/* Hero */}
+      <div className="bg-gradient-to-br from-sky-600 to-indigo-700 rounded-2xl p-6 text-white">
+        <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+          <div>
+            <h2 className="text-xl font-bold">AI 选品决策工具</h2>
+            <p className="text-sky-100 mt-1 text-sm max-w-md">整合竞品数据、评论情感分析与搜索趋势，AI 给出可执行的选品评分与理由</p>
+          </div>
+          <button onClick={() => navigate('#/new')}
+            className="bg-white text-sky-700 font-semibold px-5 py-2.5 rounded-xl hover:bg-sky-50 transition-colors text-sm shrink-0 flex items-center gap-1.5">
+            ✦ 开始新分析
+          </button>
+        </div>
+      </div>
+
+      {/* Stats */}
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+        {cards.map(({ l, v, s, icon, bg, tc }) => (
+          <div key={l} className="bg-white rounded-2xl border border-slate-100 p-5 flex items-center gap-4">
+            <div className={`w-11 h-11 ${bg} ${tc} rounded-xl flex items-center justify-center text-xl shrink-0`}>{icon}</div>
+            <div>
+              <div className="text-2xl font-bold text-slate-900">{v}</div>
+              <div className="text-sm font-medium text-slate-700">{l}</div>
+              <div className="text-xs text-slate-400">{s}</div>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {/* Charts Row */}
+      <div className="grid md:grid-cols-2 gap-6">
+        <div className="bg-white rounded-2xl border border-slate-100 p-6">
+          <h3 className="font-semibold text-slate-800 mb-4">类目分布</h3>
+          {stats?.top_categories?.length > 0 ? (
+            <CssBarChart data={stats.top_categories} dataKey="count" nameKey="category" height={170} />
+          ) : (
+            <div className="h-40 flex items-center justify-center text-slate-400 text-sm">暂无数据，开始第一个分析</div>
+          )}
+        </div>
+
+        <div className="bg-white rounded-2xl border border-slate-100 p-6">
+          <h3 className="font-semibold text-slate-800 mb-4">快速入门</h3>
+          <div className="space-y-3">
+            {[
+              { n:'1', t:'输入产品名称', d:'支持中英文，可附加描述与评论', c:'sky' },
+              { n:'2', t:'AI 多维度分析', d:'评估市场需求、竞争格局、利润空间', c:'violet' },
+              { n:'3', t:'获取选品报告', d:'综合评分 + 理由 + 风险 + 机会点', c:'emerald' },
+            ].map(({ n, t, d, c }) => (
+              <div key={n} className="flex items-start gap-3">
+                <div className={`w-7 h-7 rounded-full flex items-center justify-center text-sm font-bold shrink-0
+                  ${c==='sky'?'bg-sky-100 text-sky-700':c==='violet'?'bg-violet-100 text-violet-700':'bg-emerald-100 text-emerald-700'}`}>{n}</div>
+                <div>
+                  <div className="font-medium text-slate-800 text-sm">{t}</div>
+                  <div className="text-xs text-slate-500">{d}</div>
+                </div>
+              </div>
+            ))}
+            <button onClick={() => navigate('#/new')}
+              className="w-full bg-sky-600 hover:bg-sky-700 text-white font-semibold py-2.5 rounded-xl text-sm transition-colors mt-2">
+              立即开始 →
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── New Analysis Page ──────────────────────────────────────────────
+function NewAnalysis({ navigate }) {
+  const [form, setForm] = useState({ name:'', category:'', target_market:'US', description:'' });
+  const [reviews, setReviews] = useState(['']);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const upd = (k, v) => setForm(p => ({ ...p, [k]: v }));
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (!form.name.trim()) { setError('产品名称不能为空'); return; }
+    setLoading(true); setError('');
+    try {
+      const validReviews = reviews.filter(r => r.trim());
+      const result = await apiFetch('/analyses', {
+        method: 'POST',
+        body: JSON.stringify({ ...form, reviews: validReviews.length ? validReviews : undefined }),
+      });
+      navigate(`#/analyses/${result.id}`);
+    } catch (err) {
+      setError(err.message); setLoading(false);
+    }
+  };
+
+  return (
+    <div className="max-w-2xl mx-auto fade-in">
+      <div className="mb-6">
+        <h1 className="text-2xl font-bold text-slate-900">新建选品分析</h1>
+        <p className="text-slate-500 mt-1 text-sm">填写产品信息，AI 将在几秒内生成完整的选品报告</p>
+      </div>
+      <form onSubmit={submit} className="space-y-5">
+        {/* Basic Info */}
+        <div className="bg-white rounded-2xl border border-slate-100 p-6 space-y-4">
+          <h2 className="font-semibold text-slate-800 flex items-center gap-2 text-sm">
+            <span className="w-6 h-6 bg-sky-100 text-sky-700 rounded-full flex items-center justify-center text-xs font-bold">1</span>
+            基本信息
+          </h2>
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">产品名称 <span className="text-red-500">*</span></label>
+            <input value={form.name} onChange={e => upd('name', e.target.value)} required
+              placeholder="例：Portable Neck Fan / 颈挂风扇"
+              className="w-full border border-slate-200 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-400" />
+          </div>
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1.5">产品类目</label>
+              <select value={form.category} onChange={e => upd('category', e.target.value)}
+                className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-sky-400">
+                <option value="">选择类目…</option>
+                {CATEGORIES.map(c => <option key={c} value={c}>{c}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1.5">目标市场</label>
+              <select value={form.target_market} onChange={e => upd('target_market', e.target.value)}
+                className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-sky-400">
+                {MARKETS.map(m => <option key={m.v} value={m.v}>{m.l}</option>)}
+              </select>
+            </div>
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">
+              产品描述 <span className="text-slate-400 text-xs">（可选，补充背景信息提升分析质量）</span>
+            </label>
+            <textarea value={form.description} onChange={e => upd('description', e.target.value)}
+              rows={3} placeholder="例：面向夏季户外运动用户，可穿戴无叶片风扇，支持 USB 充电，续航 8 小时"
+              className="w-full border border-slate-200 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-400 resize-none" />
+          </div>
+        </div>
+
+        {/* Reviews */}
+        <div className="bg-white rounded-2xl border border-slate-100 p-6 space-y-4">
+          <div className="flex items-center justify-between">
+            <h2 className="font-semibold text-slate-800 flex items-center gap-2 text-sm">
+              <span className="w-6 h-6 bg-sky-100 text-sky-700 rounded-full flex items-center justify-center text-xs font-bold">2</span>
+              竞品评论样本 <span className="text-slate-400 text-xs">（可选）</span>
+            </h2>
+            <button type="button" onClick={() => setReviews(p => [...p, ''])}
+              className="text-xs bg-slate-100 hover:bg-slate-200 text-slate-700 px-3 py-1.5 rounded-lg transition-colors">
+              + 添加评论
+            </button>
+          </div>
+          <div className="bg-sky-50 rounded-xl p-3 text-xs text-sky-700 flex items-start gap-2">
+            <span className="mt-0.5">ℹ️</span>
+            粘贴竞品的真实用户评论，AI 将进行情感分析，提取痛点与好评，纳入综合评分。
+          </div>
+          {reviews.map((r, i) => (
+            <div key={i} className="flex gap-2">
+              <textarea value={r} onChange={e => setReviews(p => p.map((x,j) => j===i ? e.target.value : x))}
+                rows={2} placeholder={`评论 ${i+1}：例 "Great fan, battery lasts all day!"`}
+                className="flex-1 border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-400 resize-none" />
+              <button type="button" onClick={() => setReviews(p => p.filter((_,j) => j!==i))}
+                className="p-2 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors self-start">✕</button>
+            </div>
+          ))}
+        </div>
+
+        {error && <div className="bg-red-50 border border-red-200 rounded-xl px-4 py-3 text-red-700 text-sm">{error}</div>}
+
+        <div className="flex gap-3">
+          <button type="button" onClick={() => navigate('#/')}
+            className="flex-1 bg-slate-100 hover:bg-slate-200 text-slate-700 font-medium py-2.5 rounded-xl text-sm transition-colors">
+            取消
+          </button>
+          <button type="submit" disabled={loading || !form.name.trim()}
+            className="flex-1 bg-sky-600 hover:bg-sky-700 disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold py-2.5 rounded-xl text-sm transition-colors flex items-center justify-center gap-2">
+            {loading ? <><Spinner size={16} /> 提交中…</> : '✦ 开始 AI 分析'}
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+// ─── Analyses List ──────────────────────────────────────────────────
+function AnalysisList({ navigate }) {
+  const [items, setItems] = useState([]);
+  const [total, setTotal] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [search, setSearch] = useState('');
+  const [filterRec, setFilterRec] = useState('');
+  const [filterStarred, setFilterStarred] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const params = new URLSearchParams({ limit: 50, skip: 0 });
+      if (search) params.set('search', search);
+      if (filterRec) params.set('recommendation', filterRec);
+      if (filterStarred) params.set('starred', 'true');
+      const data = await apiFetch(`/analyses?${params}`);
+      setItems(data.items); setTotal(data.total);
+    } catch(e) { console.error(e); }
+    finally { setLoading(false); }
+  }, [search, filterRec, filterStarred]);
+
+  useEffect(() => { load(); }, [load]);
+
+  // Auto-poll if any pending
+  useEffect(() => {
+    const hasPending = items.some(a => ['pending','analyzing'].includes(a.status));
+    if (!hasPending) return;
+    const t = setInterval(load, 2500);
+    return () => clearInterval(t);
+  }, [items, load]);
+
+  const toggleStar = async (id, starred) => {
+    await apiFetch(`/analyses/${id}`, { method:'PATCH', body: JSON.stringify({ is_starred: !starred }) });
+    load();
+  };
+
+  return (
+    <div className="space-y-5 fade-in">
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-2xl font-bold text-slate-900">选品库</h1>
+          <p className="text-slate-500 text-sm mt-0.5">共 {total} 条分析记录</p>
+        </div>
+        <button onClick={() => navigate('#/new')}
+          className="bg-sky-600 hover:bg-sky-700 text-white font-semibold px-4 py-2 rounded-xl text-sm flex items-center gap-1.5 transition-colors">
+          + 新建分析
+        </button>
+      </div>
+
+      {/* Filters */}
+      <div className="bg-white rounded-2xl border border-slate-100 p-4 flex flex-wrap gap-3 items-center">
+        <div className="relative flex-1 min-w-40">
+          <span className="absolute left-3 top-2.5 text-slate-400 text-sm">🔍</span>
+          <input value={search} onChange={e => setSearch(e.target.value)}
+            placeholder="搜索产品名称…"
+            className="w-full pl-8 pr-4 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-sky-400" />
+        </div>
+        <select value={filterRec} onChange={e => setFilterRec(e.target.value)}
+          className="border border-slate-200 rounded-xl px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-sky-400">
+          <option value="">全部建议</option>
+          {Object.entries(REC_CFG).map(([k,v]) => <option key={k} value={k}>{v.label}</option>)}
+        </select>
+        <button onClick={() => setFilterStarred(p => !p)}
+          className={`flex items-center gap-1.5 px-3 py-2 rounded-xl text-sm border transition-colors ${
+            filterStarred ? 'bg-amber-50 border-amber-300 text-amber-700' : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'}`}>
+          ★ 收藏
+        </button>
+        <button onClick={load} className="bg-slate-100 hover:bg-slate-200 text-slate-700 px-3 py-2 rounded-xl text-sm transition-colors">↻ 刷新</button>
+      </div>
+
+      {/* Items */}
+      {loading ? (
+        <div className="flex items-center justify-center h-32"><Spinner size={28} /></div>
+      ) : items.length === 0 ? (
+        <div className="bg-white rounded-2xl border border-slate-100 text-center py-16">
+          <div className="text-5xl mb-4">🔍</div>
+          <h3 className="font-semibold text-slate-800 text-lg mb-2">暂无分析记录</h3>
+          <p className="text-slate-500 text-sm mb-6">输入产品名称，AI 将分析市场潜力与选品价值</p>
+          <button onClick={() => navigate('#/new')}
+            className="bg-sky-600 text-white font-semibold px-6 py-2.5 rounded-xl hover:bg-sky-700 transition-colors text-sm">
+            开始第一个分析
+          </button>
+        </div>
+      ) : (
+        <div className="grid gap-3">
+          {items.map(a => {
+            const sc = STATUS_CFG[a.status] || STATUS_CFG.pending;
+            return (
+              <div key={a.id} onClick={() => navigate(`#/analyses/${a.id}`)}
+                className="bg-white rounded-2xl border border-slate-100 p-5 cursor-pointer hover:shadow-md hover:border-sky-200 transition-all group flex items-start gap-4">
+                <div className="flex-1 min-w-0">
+                  <div className="flex flex-wrap items-center gap-2 mb-1.5">
+                    <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${sc.cls} ${sc.pulse ? 'animate-pulse' : ''}`}>
+                      {a.status === 'analyzing' && '⟳ '}{sc.label}
+                    </span>
+                    {a.category && <span className="text-xs bg-slate-100 text-slate-600 px-2 py-0.5 rounded-full">{a.category}</span>}
+                    <span className="text-xs bg-slate-100 text-slate-600 px-2 py-0.5 rounded-full">{a.target_market}</span>
+                  </div>
+                  <h3 className="font-semibold text-slate-900 text-base truncate group-hover:text-sky-700 transition-colors">{a.name}</h3>
+                  <div className="flex items-center gap-3 mt-2">
+                    {a.ai_recommendation && <RecBadge rec={a.ai_recommendation} />}
+                  </div>
+                  <p className="text-xs text-slate-400 mt-2">🕐 {fmtDate(a.created_at)}</p>
+                </div>
+                <div className="flex items-center gap-3 shrink-0">
+                  <ScoreCircle score={a.overall_score} size="md" label="综合评分" />
+                  <div className="flex flex-col gap-1.5">
+                    <button onClick={e => { e.stopPropagation(); toggleStar(a.id, a.is_starred); }}
+                      className={`p-1.5 rounded-lg transition-colors ${a.is_starred ? 'text-amber-500 bg-amber-50' : 'text-slate-300 hover:text-amber-400 hover:bg-amber-50'}`}>
+                      ★
+                    </button>
+                    <span className="text-slate-300 group-hover:text-sky-400 transition-colors">›</span>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Analysis Detail ────────────────────────────────────────────────
+function AnalysisDetail({ id, navigate }) {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [delConfirm, setDelConfirm] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      const r = await apiFetch(`/analyses/${id}`);
+      setData(r);
+    } catch(e) { console.error(e); }
+    finally { setLoading(false); }
+  }, [id]);
+
+  useEffect(() => { load(); }, [load]);
+
+  // Poll while processing
+  useEffect(() => {
+    if (!data || !['pending','analyzing'].includes(data.status)) return;
+    const t = setInterval(load, 2000);
+    return () => clearInterval(t);
+  }, [data, load]);
+
+  if (loading) return <div className="flex items-center justify-center h-64"><Spinner size={32} /></div>;
+  if (!data) return <div className="text-center py-16 text-slate-500">分析记录不存在</div>;
+
+  const sc = STATUS_CFG[data.status] || STATUS_CFG.pending;
+  const isProcessing = ['pending','analyzing'].includes(data.status);
+
+  const radarData = [
+    { s:'市场需求', v: data.market_demand_score || 0 },
+    { s:'竞争空间', v: data.competition_score || 0 },
+    { s:'利润空间', v: data.profit_margin_score || 0 },
+    { s:'趋势热度', v: data.trend_score || 0 },
+    { s:'消费口碑', v: data.sentiment_score || 0 },
+  ];
+
+  const kwData = (data.trend_keywords || []).slice(0,5).map(k => ({
+    name: k.keyword?.length > 22 ? k.keyword.slice(0,22)+'…' : k.keyword,
+    val: k.volume === 'HIGH' ? 90 : k.volume === 'MEDIUM' ? 55 : 25,
+    growth: k.growth, platform: k.platform,
+  }));
+
+  const handleStar = async () => {
+    const r = await apiFetch(`/analyses/${id}`, { method:'PATCH', body: JSON.stringify({ is_starred: !data.is_starred }) });
+    setData(r);
+  };
+  const handleReanalyze = async () => {
+    await apiFetch(`/analyses/${id}/reanalyze`, { method:'POST' });
+    await load();
+  };
+  const handleDelete = async () => {
+    await apiFetch(`/analyses/${id}`, { method:'DELETE' });
+    navigate('#/analyses');
+  };
+
+  return (
+    <div className="space-y-5 max-w-5xl mx-auto fade-in">
+      {/* Header */}
+      <div className="flex items-start gap-3 flex-wrap">
+        <button onClick={() => navigate('#/analyses')}
+          className="bg-slate-100 hover:bg-slate-200 text-slate-700 px-3 py-1.5 rounded-xl text-sm font-medium transition-colors flex items-center gap-1 shrink-0">
+          ← 返回
+        </button>
+        <div className="flex-1">
+          <div className="flex flex-wrap items-center gap-2 mb-1">
+            <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${sc.cls} ${sc.pulse ? 'animate-pulse' : ''}`}>
+              {isProcessing && '⟳ '}{sc.label}
+            </span>
+            {data.category && <span className="text-xs bg-slate-100 text-slate-600 px-2 py-0.5 rounded-full">{data.category}</span>}
+            <span className="text-xs bg-slate-100 text-slate-600 px-2 py-0.5 rounded-full">{data.target_market}</span>
+          </div>
+          <h1 className="text-xl font-bold text-slate-900">{data.name}</h1>
+          <p className="text-xs text-slate-400 mt-0.5">创建于 {fmtDate(data.created_at)}</p>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          <button onClick={handleStar}
+            className={`p-2 rounded-xl transition-colors ${data.is_starred ? 'text-amber-500 bg-amber-50' : 'text-slate-400 hover:bg-slate-100'}`}>
+            {data.is_starred ? '★' : '☆'}
+          </button>
+          <button onClick={handleReanalyze} disabled={isProcessing}
+            className="bg-slate-100 hover:bg-slate-200 text-slate-700 px-3 py-1.5 rounded-xl text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-1.5">
+            ↻ 重新分析
+          </button>
+          {delConfirm ? (
+            <div className="flex gap-1.5">
+              <button onClick={handleDelete} className="bg-red-500 text-white px-3 py-1.5 rounded-lg text-sm font-medium hover:bg-red-600">确认删除</button>
+              <button onClick={() => setDelConfirm(false)} className="bg-slate-100 text-slate-700 px-3 py-1.5 rounded-lg text-sm hover:bg-slate-200">取消</button>
+            </div>
+          ) : (
+            <button onClick={() => setDelConfirm(true)} className="p-2 rounded-xl text-slate-400 hover:text-red-500 hover:bg-red-50 transition-colors">🗑</button>
+          )}
+        </div>
+      </div>
+
+      {/* Processing */}
+      {isProcessing && (
+        <div className="bg-sky-50 border border-sky-200 rounded-2xl p-5 flex items-center gap-4">
+          <Spinner size={28} />
+          <div>
+            <p className="font-semibold text-sky-800">AI 正在分析中…</p>
+            <p className="text-sm text-sky-600">正在评估市场需求、竞争格局、情感倾向，约 3–8 秒完成</p>
+          </div>
+        </div>
+      )}
+
+      {data.status === 'completed' && (<>
+        {/* Hero Row */}
+        <div className="bg-white rounded-2xl border border-slate-100 p-6">
+          <div className="flex flex-col md:flex-row items-start md:items-center gap-6">
+            <ScoreCircle score={data.overall_score} size="lg" label="综合评分" />
+            <div className="flex-1">
+              <div className="flex items-center gap-3 mb-2.5 flex-wrap">
+                <RecBadge rec={data.ai_recommendation} />
+                <span className="text-slate-400 text-sm">AI 选品建议</span>
+              </div>
+              <p className="text-slate-700 text-sm leading-relaxed"
+                 dangerouslySetInnerHTML={{ __html: (data.ai_summary||'').replace(/\*\*(.*?)\*\*/g,'<strong>$1</strong>') }} />
+            </div>
+            <div className="grid grid-cols-3 gap-3 shrink-0">
+              {[
+                { icon:'💵', l:'建议售价',  v: data.avg_price_usd ? `$${data.avg_price_usd.toFixed(0)}` : '—' },
+                { icon:'📊', l:'月销量估算', v: fmtNum(data.estimated_monthly_sales) },
+                { icon:'🏪', l:'竞品数量',  v: fmtNum(data.competition_count) },
+              ].map(({ icon, l, v }) => (
+                <div key={l} className="bg-slate-50 rounded-xl p-3 text-center">
+                  <div className="text-lg mb-0.5">{icon}</div>
+                  <div className="text-base font-bold text-slate-900">{v}</div>
+                  <div className="text-xs text-slate-500">{l}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        {/* Score + Radar */}
+        <div className="grid md:grid-cols-2 gap-5">
+          <div className="bg-white rounded-2xl border border-slate-100 p-6 space-y-4">
+            <h2 className="font-semibold text-slate-800">维度评分</h2>
+            <ScoreBar label="市场需求" score={data.market_demand_score} icon="📈" />
+            <ScoreBar label="竞争空间（越高越易入）" score={data.competition_score} icon="🏆" />
+            <ScoreBar label="利润空间" score={data.profit_margin_score} icon="💰" />
+            <ScoreBar label="趋势热度" score={data.trend_score} icon="🔥" />
+            <ScoreBar label="消费口碑" score={data.sentiment_score} icon="💬" />
+          </div>
+          <div className="bg-white rounded-2xl border border-slate-100 p-6">
+            <h2 className="font-semibold text-slate-800 mb-2">能力雷达图</h2>
+            <SvgRadar data={radarData} size={220} />
+          </div>
+        </div>
+
+        {/* Insights Row */}
+        <div className="grid md:grid-cols-3 gap-5">
+          {[
+            { title:'✅ 选品理由', items: data.ai_reasons || [], dotCls:'bg-emerald-400', numBg:'bg-emerald-100 text-emerald-700' },
+            { title:'⚠️ 风险提示',  items: data.ai_risks || [],   dotCls:'bg-amber-400',  numBg:null },
+            { title:'💡 机会点',    items: data.ai_opportunities || [], dotCls:'bg-sky-400', numBg:null },
+          ].map(({ title, items, dotCls, numBg }) => (
+            <div key={title} className="bg-white rounded-2xl border border-slate-100 p-5">
+              <h2 className="font-semibold text-slate-800 mb-3 text-sm">{title}</h2>
+              <ul className="space-y-2">
+                {items.map((t, i) => (
+                  <li key={i} className="flex items-start gap-2 text-sm text-slate-600">
+                    {numBg
+                      ? <span className={`w-4 h-4 ${numBg} rounded-full flex items-center justify-center text-[10px] font-bold shrink-0 mt-0.5`}>{i+1}</span>
+                      : <span className={`w-1.5 h-1.5 ${dotCls} rounded-full shrink-0 mt-2`} />
+                    }
+                    {t}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ))}
+        </div>
+
+        {/* Keyword Trends */}
+        {kwData.length > 0 && (
+          <div className="bg-white rounded-2xl border border-slate-100 p-6">
+            <h2 className="font-semibold text-slate-800 mb-4">📈 搜索趋势关键词</h2>
+            <div className="grid md:grid-cols-2 gap-4">
+              <CssHBarChart data={kwData} valKey="val" nameKey="name" />
+              <div className="space-y-1.5">
+                {(data.trend_keywords||[]).slice(0,5).map((kw,i) => (
+                  <div key={i} className="flex items-center justify-between py-1.5 border-b border-slate-100 last:border-0 text-sm">
+                    <span className="text-slate-700 flex-1 truncate text-xs">{kw.keyword}</span>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <span className="text-xs bg-slate-100 text-slate-600 px-1.5 py-0.5 rounded-full">{kw.platform}</span>
+                      <span className={`text-xs font-semibold ${(kw.growth||'').startsWith('+') ? 'text-emerald-600' : 'text-red-500'}`}>{kw.growth}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Competitors */}
+        {data.top_competitors?.length > 0 && (
+          <div className="bg-white rounded-2xl border border-slate-100 p-6">
+            <h2 className="font-semibold text-slate-800 mb-4">🏪 竞品分析</h2>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-slate-100">
+                    {['竞品','价格','评分','评论数','月销量'].map(h => (
+                      <th key={h} className="text-left text-xs font-semibold text-slate-500 pb-2 pr-4 whitespace-nowrap">{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {data.top_competitors.map((c,i) => (
+                    <tr key={i} className="border-b border-slate-50 last:border-0">
+                      <td className="py-2.5 pr-4 font-medium text-slate-800">{c.name}</td>
+                      <td className="py-2.5 pr-4 text-slate-600">{c.price_usd ? `$${c.price_usd.toFixed(2)}` : '—'}</td>
+                      <td className="py-2.5 pr-4">
+                        <span className={`font-semibold ${c.rating>=4.5?'text-emerald-600':c.rating>=4?'text-sky-600':'text-amber-600'}`}>
+                          {c.rating ? `⭐ ${c.rating}` : '—'}
+                        </span>
+                      </td>
+                      <td className="py-2.5 pr-4 text-slate-600">{fmtNum(c.review_count)}</td>
+                      <td className="py-2.5 text-slate-600">{fmtNum(c.monthly_sales_est)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {/* Platform Insights */}
+        {data.platform_insights && (
+          <div className="bg-white rounded-2xl border border-slate-100 p-6">
+            <h2 className="font-semibold text-slate-800 mb-4">🌐 平台机会</h2>
+            <div className="grid md:grid-cols-3 gap-4">
+              {Object.entries(data.platform_insights).map(([plat, info]) => (
+                <div key={plat} className="bg-slate-50 rounded-xl p-4">
+                  <div className="font-semibold text-slate-800 capitalize mb-2 flex items-center gap-2">
+                    <span>{{ amazon:'🛒', tiktok:'📱', shopify:'🏪' }[plat] || '📦'}</span>
+                    {plat}
+                  </div>
+                  {Object.entries(info).map(([k,v]) => (
+                    <p key={k} className="text-xs text-slate-600 mb-1">
+                      <span className="font-medium text-slate-700">{k.replace(/_/g,' ')}：</span>{String(v)}
+                    </p>
+                  ))}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </>)}
+
+      {data.status === 'failed' && (
+        <div className="bg-red-50 border border-red-200 rounded-2xl text-center py-14">
+          <div className="text-4xl mb-3">❌</div>
+          <p className="font-semibold text-red-700 mb-2">分析失败</p>
+          <p className="text-sm text-red-600 mb-5">AI 分析过程中遇到问题，请重试</p>
+          <button onClick={handleReanalyze} className="bg-sky-600 text-white px-5 py-2.5 rounded-xl font-semibold hover:bg-sky-700 transition-colors text-sm">重新分析</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Error Boundary ─────────────────────────────────────────────────
+class ErrorBoundary extends React.Component {
+  constructor(props) { super(props); this.state = { err: null }; }
+  static getDerivedStateFromError(err) { return { err }; }
+  componentDidCatch(err, info) {
+    const el = document.getElementById('app-error');
+    if (el) { el.style.display = 'block'; el.textContent = '⚠️ React 错误: ' + err.message; }
+  }
+  render() {
+    if (this.state.err) return (
+      <div className="min-h-screen flex items-center justify-center bg-slate-50">
+        <div className="bg-white border border-red-200 rounded-2xl p-8 max-w-md text-center shadow">
+          <div className="text-4xl mb-3">💥</div>
+          <h2 className="text-lg font-bold text-slate-800 mb-2">页面出错了</h2>
+          <p className="text-sm text-red-600 font-mono bg-red-50 p-3 rounded-lg text-left">{this.state.err.message}</p>
+          <button onClick={() => this.setState({err:null})}
+            className="mt-5 bg-sky-600 text-white px-5 py-2.5 rounded-xl font-semibold hover:bg-sky-700 text-sm">
+            重试
+          </button>
+        </div>
+      </div>
+    );
+    return this.props.children;
+  }
+}
+
+// ─── Footer ─────────────────────────────────────────────────────────
+function Footer({ mode }) {
+  return (
+    <footer className="border-t border-slate-100 mt-12 py-4">
+      <div className="max-w-6xl mx-auto px-4 sm:px-6 flex items-center justify-center">
+        {mode === 'minimax' ? (
+          <span className="text-xs text-slate-400">
+            ⚡ MiniMax AI 已启用 — 所有分析由 MiniMax-Text-01 驱动
+          </span>
+        ) : (
+          <span className="text-xs text-slate-400">
+            演示模式 — 在 backend/.env 中配置 MINIMAX_API_KEY 启用 AI
+          </span>
+        )}
+      </div>
+    </footer>
+  );
+}
+
+// ─── App Root ───────────────────────────────────────────────────────
+function App() {
+  const { hash, navigate } = useRoute();
+  const [mode, setMode] = useState('demo');
+
+  useEffect(() => {
+    const el = document.getElementById('app-loading');
+    if (el) el.style.display = 'none';
+    apiFetch('/health').then(h => setMode(h.ai_mode)).catch(() => {});
+  }, []);
+
+  let page;
+  if (hash === '#/' || hash === '#') {
+    page = <Dashboard navigate={navigate} />;
+  } else if (hash === '#/analyses') {
+    page = <AnalysisList navigate={navigate} />;
+  } else if (hash === '#/new') {
+    page = <NewAnalysis navigate={navigate} />;
+  } else if (hash.startsWith('#/analyses/')) {
+    const id = hash.replace('#/analyses/','');
+    page = <AnalysisDetail id={id} navigate={navigate} />;
+  } else {
+    page = <Dashboard navigate={navigate} />;
+  }
+
+  return (
+    <div className="min-h-screen bg-slate-50 flex flex-col">
+      <Navbar navigate={navigate} currentHash={hash} />
+      <main className="max-w-6xl w-full mx-auto px-4 sm:px-6 py-8 flex-1">
+        {page}
+      </main>
+      <Footer mode={mode} />
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(
+  <ErrorBoundary><App /></ErrorBoundary>
+);
+</script>
+</body>
+</html>
