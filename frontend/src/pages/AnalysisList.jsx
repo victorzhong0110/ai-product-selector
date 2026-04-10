@@ -1,21 +1,34 @@
 import React, { useState, useEffect, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Search, Filter, Plus, Star, RefreshCw } from 'lucide-react'
+import { Search, Plus, Star, RefreshCw, Tag } from 'lucide-react'
 import { ProductCard } from '../components/ProductCard'
-import { analysisApi, dashboardApi } from '../utils/api'
+import { analysisApi, dashboardApi, tagsApi } from '../utils/api'
 import { RECOMMENDATION_CONFIG, CATEGORIES } from '../utils/helpers'
+import { useAuth } from '../contexts/AuthContext'
+import { useLanguage } from '../contexts/LangContext'
 
 export function AnalysisList() {
   const navigate = useNavigate()
+  const { user } = useAuth()
+  const { t } = useLanguage()
   const [analyses, setAnalyses] = useState([])
-  const [total, setTotal] = useState(0)
-  const [loading, setLoading] = useState(true)
-  const [filters, setFilters] = useState({
+  const [total, setTotal]       = useState(0)
+  const [loading, setLoading]   = useState(true)
+  const [userTags, setUserTags] = useState([])
+  const [filters, setFilters]   = useState({
     search: '',
     category: '',
     recommendation: '',
     starred: false,
+    tag_id: '',
   })
+
+  // Load user tags if logged in
+  useEffect(() => {
+    if (user) {
+      tagsApi.list().then(setUserTags).catch(() => {})
+    }
+  }, [user])
 
   const fetchData = useCallback(async () => {
     setLoading(true)
@@ -23,10 +36,11 @@ export function AnalysisList() {
       const params = {
         limit: 50,
         skip: 0,
-        ...(filters.search && { search: filters.search }),
-        ...(filters.category && { category: filters.category }),
+        ...(filters.search         && { search: filters.search }),
+        ...(filters.category       && { category: filters.category }),
         ...(filters.recommendation && { recommendation: filters.recommendation }),
-        ...(filters.starred && { starred: true }),
+        ...(filters.starred        && { starred: true }),
+        ...(filters.tag_id         && { tag_id: filters.tag_id }),
       }
       const data = await analysisApi.list(params)
       setAnalyses(data.items)
@@ -38,9 +52,7 @@ export function AnalysisList() {
     }
   }, [filters])
 
-  useEffect(() => {
-    fetchData()
-  }, [fetchData])
+  useEffect(() => { fetchData() }, [fetchData])
 
   // Auto-refresh if any analyses are still processing
   useEffect(() => {
@@ -54,12 +66,12 @@ export function AnalysisList() {
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-slate-900">选品库</h1>
-          <p className="text-slate-500 text-sm mt-0.5">共 {total} 条分析记录</p>
+          <h1 className="text-2xl font-bold text-slate-900">{t('list.title')}</h1>
+          <p className="text-slate-500 text-sm mt-0.5">{t('list.subtitle', { count: total })}</p>
         </div>
         <button onClick={() => navigate('/new')} className="btn-primary flex items-center gap-2 text-sm">
           <Plus size={16} />
-          新建分析
+          {t('list.newAnalysis')}
         </button>
       </div>
 
@@ -70,7 +82,7 @@ export function AnalysisList() {
           <Search size={15} className="absolute left-3 top-2.5 text-slate-400" />
           <input
             type="text"
-            placeholder="搜索产品名称…"
+            placeholder={t('list.search')}
             value={filters.search}
             onChange={e => setFilters(p => ({ ...p, search: e.target.value }))}
             className="w-full pl-9 pr-4 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-sky-400"
@@ -83,7 +95,7 @@ export function AnalysisList() {
           onChange={e => setFilters(p => ({ ...p, category: e.target.value }))}
           className="border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-400 bg-white"
         >
-          <option value="">全部类目</option>
+          <option value="">{t('list.allCategories')}</option>
           {CATEGORIES.map(c => <option key={c} value={c}>{c}</option>)}
         </select>
 
@@ -93,11 +105,25 @@ export function AnalysisList() {
           onChange={e => setFilters(p => ({ ...p, recommendation: e.target.value }))}
           className="border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-400 bg-white"
         >
-          <option value="">全部建议</option>
+          <option value="">{t('list.allRecommendations')}</option>
           {Object.entries(RECOMMENDATION_CONFIG).map(([key, val]) => (
             <option key={key} value={key}>{val.label}</option>
           ))}
         </select>
+
+        {/* Tag filter (only if user is logged in and has tags) */}
+        {user && userTags.length > 0 && (
+          <select
+            value={filters.tag_id}
+            onChange={e => setFilters(p => ({ ...p, tag_id: e.target.value }))}
+            className="border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-400 bg-white"
+          >
+            <option value="">{t('list.allTags')}</option>
+            {userTags.map(tag => (
+              <option key={tag.id} value={tag.id}>{tag.name}</option>
+            ))}
+          </select>
+        )}
 
         {/* Starred */}
         <button
@@ -109,12 +135,12 @@ export function AnalysisList() {
           }`}
         >
           <Star size={14} fill={filters.starred ? 'currentColor' : 'none'} />
-          收藏
+          {t('list.starred')}
         </button>
 
         <button onClick={fetchData} className="btn-secondary flex items-center gap-1.5 text-sm">
           <RefreshCw size={14} />
-          刷新
+          {t('list.refresh')}
         </button>
       </div>
 
@@ -137,10 +163,10 @@ export function AnalysisList() {
       ) : analyses.length === 0 ? (
         <div className="card text-center py-16">
           <div className="text-5xl mb-4">🔍</div>
-          <h3 className="font-semibold text-slate-800 text-lg mb-2">暂无分析记录</h3>
-          <p className="text-slate-500 text-sm mb-6">输入产品名称，AI 将为你分析市场潜力与选品价值</p>
+          <h3 className="font-semibold text-slate-800 text-lg mb-2">{t('list.empty.title')}</h3>
+          <p className="text-slate-500 text-sm mb-6">{t('list.empty.subtitle')}</p>
           <button onClick={() => navigate('/new')} className="btn-primary">
-            开始第一个分析
+            {t('list.empty.cta')}
           </button>
         </div>
       ) : (

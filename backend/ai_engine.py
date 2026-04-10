@@ -37,8 +37,9 @@ def has_api_key() -> bool:
 
 # ─── MiniMax HTTP caller (stdlib only) ────────────────────────────────
 
-def _call_minimax(messages: list, max_tokens: int = 2048) -> str:
+def _call_minimax(messages: list, max_tokens: int = 2048, api_key: str = "") -> str:
     """Synchronous call to MiniMax API via urllib (no extra packages needed)."""
+    key = api_key or MINIMAX_API_KEY
     payload = json.dumps({
         "model": MINIMAX_MODEL,
         "messages": messages,
@@ -51,7 +52,7 @@ def _call_minimax(messages: list, max_tokens: int = 2048) -> str:
         data=payload,
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {MINIMAX_API_KEY}",
+            "Authorization": f"Bearer {key}",
         },
         method="POST",
     )
@@ -219,12 +220,15 @@ async def analyze_product_with_minimax(
     target_market: str,
     description: Optional[str] = None,
     reviews: Optional[List[str]] = None,
+    api_key_override: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Main analysis function.
     Uses MiniMax API when key is configured, falls back to demo mode.
+    api_key_override: if provided, use this key instead of the env key.
     """
-    if not has_api_key():
+    effective_key = api_key_override or MINIMAX_API_KEY
+    if not (effective_key and effective_key != "your_api_key_here"):
         await asyncio.sleep(2.5)
         return _generate_demo(product_name, category or "General")
 
@@ -238,7 +242,7 @@ async def analyze_product_with_minimax(
         ]
         # Run blocking urllib call in thread pool
         raw = await loop.run_in_executor(
-            None, lambda: _call_minimax(messages, max_tokens=2048)
+            None, lambda: _call_minimax(messages, max_tokens=2048, api_key=effective_key)
         )
 
         # Strip potential markdown fences
