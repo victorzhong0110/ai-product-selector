@@ -1,14 +1,23 @@
-import React from 'react'
+import React, { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Star, Clock, RefreshCw, ChevronRight } from 'lucide-react'
+import { Star, Clock, ChevronRight } from 'lucide-react'
 import { RecommendationBadge } from './RecommendationBadge'
 import { ScoreGauge } from './ScoreGauge'
 import { STATUS_CONFIG, formatDate } from '../utils/helpers'
 import { analysisApi } from '../utils/api'
+import { useAuth } from '../contexts/AuthContext'
 
 export function ProductCard({ analysis, onUpdate }) {
   const navigate = useNavigate()
+  const { user } = useAuth()
   const statusConf = STATUS_CONFIG[analysis.status] || STATUS_CONFIG.pending
+  const [tags, setTags] = useState([])
+
+  useEffect(() => {
+    if (user) {
+      analysisApi.getTags(analysis.id).then(setTags).catch(() => {})
+    }
+  }, [analysis.id, user])
 
   const handleStar = async (e) => {
     e.stopPropagation()
@@ -26,7 +35,7 @@ export function ProductCard({ analysis, onUpdate }) {
       <div className="flex items-start justify-between gap-4">
         {/* Left: Info */}
         <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2 mb-1.5">
+          <div className="flex items-center gap-2 mb-1.5 flex-wrap">
             <span className={`badge ${statusConf.color} ${statusConf.pulse ? 'animate-pulse' : ''}`}>
               {statusConf.label}
             </span>
@@ -34,6 +43,17 @@ export function ProductCard({ analysis, onUpdate }) {
               <span className="badge bg-slate-100 text-slate-600">{analysis.category}</span>
             )}
             <span className="badge bg-slate-100 text-slate-600">{analysis.target_market}</span>
+            {/* Tag badges */}
+            {tags.map(tag => (
+              <span
+                key={tag.id}
+                onClick={e => e.stopPropagation()}
+                className="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium text-white"
+                style={{ backgroundColor: tag.color || '#6366f1' }}
+              >
+                {tag.name}
+              </span>
+            ))}
           </div>
           <h3 className="font-semibold text-slate-900 text-base truncate group-hover:text-sky-700 transition-colors">
             {analysis.name}

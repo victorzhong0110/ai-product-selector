@@ -3,9 +3,11 @@ import { useNavigate } from 'react-router-dom'
 import { Sparkles, Plus, X, ChevronDown, Loader2, Info } from 'lucide-react'
 import { analysisApi } from '../utils/api'
 import { CATEGORIES, MARKETS } from '../utils/helpers'
+import { useLanguage } from '../contexts/LangContext'
 
 export function NewAnalysis() {
   const navigate = useNavigate()
+  const { t } = useLanguage()
   const [form, setForm] = useState({
     name: '',
     category: '',
@@ -46,8 +48,8 @@ export function NewAnalysis() {
   return (
     <div className="max-w-2xl mx-auto">
       <div className="mb-6">
-        <h1 className="text-2xl font-bold text-slate-900">新建选品分析</h1>
-        <p className="text-slate-500 mt-1">填写产品信息，AI 将在几秒内生成完整的选品报告</p>
+        <h1 className="text-2xl font-bold text-slate-900">{t('new.title')}</h1>
+        <p className="text-slate-500 mt-1">{t('new.subtitle')}</p>
       </div>
 
       <form onSubmit={handleSubmit} className="space-y-6">
