@@ -23,5 +23,9 @@ __pycache__/
 *.swp
 *.swo
 
+# Node
+frontend/node_modules/
+frontend/package-lock.json
+
 # Logs
 *.log
