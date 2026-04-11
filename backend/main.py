@@ -159,10 +159,24 @@ def init_db():
     CREATE TABLE IF NOT EXISTS user_settings (
         user_id TEXT PRIMARY KEY,
         minimax_api_key TEXT,
+        serpapi_key TEXT,
+        amazon_access_key TEXT,
+        amazon_secret_key TEXT,
+        amazon_associate_tag TEXT,
         language TEXT DEFAULT 'zh',
         FOREIGN KEY (user_id) REFERENCES users(id)
     )
     """)
+    # Migrate existing user_settings table to add new columns if missing
+    existing_cols = [r[1] for r in conn.execute("PRAGMA table_info(user_settings)").fetchall()]
+    for col, typedef in [
+        ("serpapi_key", "TEXT"),
+        ("amazon_access_key", "TEXT"),
+        ("amazon_secret_key", "TEXT"),
+        ("amazon_associate_tag", "TEXT"),
+    ]:
+        if col not in existing_cols:
+            conn.execute(f"ALTER TABLE user_settings ADD COLUMN {col} {typedef}")
 
     # New: Tags
     conn.execute("""
@@ -216,15 +230,31 @@ def row_to_dict(row):
 
 # ─── AI Engine helpers ────────────────────────────────
 
+def get_user_settings(user_id: str | None) -> dict:
+    """Return all user API keys, falling back to env vars."""
+    defaults = {
+        "minimax_api_key": _DEFAULT_API_KEY or "",
+        "serpapi_key": os.getenv("SERPAPI_KEY", ""),
+        "amazon_access_key": os.getenv("AMAZON_ACCESS_KEY", ""),
+        "amazon_secret_key": os.getenv("AMAZON_SECRET_KEY", ""),
+        "amazon_associate_tag": os.getenv("AMAZON_ASSOCIATE_TAG", ""),
+    }
+    if not user_id:
+        return defaults
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM user_settings WHERE user_id=?", (user_id,)).fetchone()
+    conn.close()
+    if not row:
+        return defaults
+    d = dict(row)
+    # Override defaults with user values where set
+    for k in defaults:
+        if d.get(k):
+            defaults[k] = d[k]
+    return defaults
+
 def get_api_key_for_user(user_id: str | None) -> str:
-    """Return user's personal API key if set, else fall back to env key."""
-    if user_id:
-        conn = get_conn()
-        row = conn.execute("SELECT minimax_api_key FROM user_settings WHERE user_id=?", (user_id,)).fetchone()
-        conn.close()
-        if row and row['minimax_api_key']:
-            return row['minimax_api_key']
-    return _DEFAULT_API_KEY or ""
+    return get_user_settings(user_id)["minimax_api_key"]
 
 # ─── Demo / background analysis ───────────────────────
 
@@ -443,6 +473,8 @@ class MeHandler(BaseHandler):
 
 # ─── Settings Handler ─────────────────────────────────
 
+_API_KEY_FIELDS = ["minimax_api_key", "serpapi_key", "amazon_access_key", "amazon_secret_key", "amazon_associate_tag"]
+
 class SettingsHandler(BaseHandler):
     def get(self):
         user = self.require_auth()
@@ -451,14 +483,12 @@ class SettingsHandler(BaseHandler):
         conn = get_conn()
         row = conn.execute("SELECT * FROM user_settings WHERE user_id=?", (user['user_id'],)).fetchone()
         conn.close()
-        if row:
-            d = dict(row)
-            # Mask API key — only send whether it's set
-            d['has_api_key'] = bool(d.get('minimax_api_key'))
-            d['minimax_api_key'] = ''
-            self.json(d)
-        else:
-            self.json({"user_id": user['user_id'], "language": "zh", "has_api_key": False, "minimax_api_key": ""})
+        d = dict(row) if row else {}
+        result = {"user_id": user['user_id'], "language": d.get("language", "zh")}
+        for f in _API_KEY_FIELDS:
+            result[f"has_{f}"] = bool(d.get(f))
+            result[f] = ""  # never return actual key values
+        self.json(result)
 
     def put(self):
         user = self.require_auth()
@@ -470,16 +500,22 @@ class SettingsHandler(BaseHandler):
         if existing:
             sets = []
             params = []
-            if 'minimax_api_key' in body:
-                sets.append("minimax_api_key=?"); params.append(body['minimax_api_key'])
+            for f in _API_KEY_FIELDS:
+                if f in body:
+                    sets.append(f"{f}=?"); params.append(body[f])
             if 'language' in body:
                 sets.append("language=?"); params.append(body['language'])
             if sets:
                 params.append(user['user_id'])
                 conn.execute(f"UPDATE user_settings SET {', '.join(sets)} WHERE user_id=?", params)
         else:
-            conn.execute("INSERT INTO user_settings (user_id, minimax_api_key, language) VALUES (?,?,?)",
-                         (user['user_id'], body.get('minimax_api_key',''), body.get('language','zh')))
+            conn.execute(
+                "INSERT INTO user_settings (user_id, minimax_api_key, serpapi_key, amazon_access_key, amazon_secret_key, amazon_associate_tag, language) VALUES (?,?,?,?,?,?,?)",
+                (user['user_id'],
+                 body.get('minimax_api_key',''), body.get('serpapi_key',''),
+                 body.get('amazon_access_key',''), body.get('amazon_secret_key',''),
+                 body.get('amazon_associate_tag',''), body.get('language','zh'))
+            )
         conn.commit()
         conn.close()
         self.json({"ok": True})
